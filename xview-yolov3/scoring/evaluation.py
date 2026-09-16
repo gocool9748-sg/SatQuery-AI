@@ -1,0 +1,133 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""Utility methods for computing the performance metrics."""
+
+from matching import Matching
+from rectangle import Rectangle
+
+
+def safe_divide(numerator, denominator):
+    """Computes the safe division to avoid the divide by zero problem."""
+    return 0 if denominator == 0 else numerator / denominator
+
+
+def compute_statistics_given_rectangle_matches(groundtruth_rects_matched, rects_matched):
+    """Computes the staticstics given the groundtruth_rects and rects matches.
+
+    Args:
+        image_id: the image_id referring to the image to be evaluated.
+        groundtruth_rects_matched: the groundtruth_rects_matched represents a list of integers returned from the
+            Matching class instance to indicate the matched rectangle indices from rects for each of
+            the groundtruth_rects.
+        rects_matched: the rects_matched represents a list of integers returned from the Matching class instance to
+            indicate the matched rectangle indices from groundtruth_rects for each of the rects.
+
+    Returns:
+        A dictionary holding the computed statistics as well as the inputs.
+    """
+    # Calculate the total_positives, true_positives, and false_positives.
+    total_positives = len(groundtruth_rects_matched)
+    true_positives = sum(item is not None for item in groundtruth_rects_matched)
+    false_positives = sum(item is None for item in rects_matched)
+    return {
+        "groundtruth_rects_matched": groundtruth_rects_matched,
+        "rects_matched": rects_matched,
+        "total_positives": total_positives,
+        "true_positives": true_positives,
+        "false_positives": false_positives,
+    }
+
+
+def compute_precision_recall_given_image_statistics_list(iou_threshold, image_statistics_list):
+    """Computes the precision recall numbers given iou_threshold and statistics.
+
+    Args:
+        iou_threshold: the iou_threshold under which the statistics are computed.
+        image_statistics_list: a list of the statistics computed and returned by the
+            compute_statistics_given_rectangle_matches method for a list of images.
+
+    Returns:
+        A dictionary holding the precision, recall as well as the inputs.
+    """
+    total_positives = 0
+    true_positives = 0
+    false_positives = 0
+    for statistics in image_statistics_list:
+        total_positives += statistics["total_positives"]
+        true_positives += statistics["true_positives"]
+        false_positives += statistics["false_positives"]
+    precision = safe_divide(true_positives, true_positives + false_positives)
+    recall = safe_divide(true_positives, total_positives)
+    return {
+        "iou_threshold": iou_threshold,
+        "precision": precision,
+        "recall": recall,
+        "image_statistics_list": image_statistics_list,
+    }
+
+
+def compute_average_precision_recall_given_precision_recall_dict(precision_recall_dict):
+    """Computes the average precision (AP) and average recall (AR).
+
+    Args:
+        precision_recall_dict: the precision_recall_dict holds the dictionary of precision and recall information
+            returned by the compute_precision_recall_given_image_statistics_list method, which is calculated under a
+            range of iou_thresholds, where the iou_threshold is the key.
+
+    Returns:
+        average_precision, average_recall.
+    """
+    precision = 0
+    recall = 0
+    for value in precision_recall_dict.values():
+        precision += value["precision"]
+        recall += value["recall"]
+    average_precision = safe_divide(precision, len(precision_recall_dict))
+    average_recall = safe_divide(recall, len(precision_recall_dict))
+    return average_precision, average_recall
+
+
+def convert_to_rectangle_list(coordinates):
+    """Converts the coordinates in a list to the Rectangle list."""
+    number_of_rects = len(coordinates) // 4
+    return [
+        Rectangle(
+            coordinates[4 * i],
+            coordinates[4 * i + 1],
+            coordinates[4 * i + 2],
+            coordinates[4 * i + 3],
+        )
+        for i in range(number_of_rects)
+    ]
+
+
+def compute_average_precision_recall(groundtruth_coordinates, coordinates, iou_threshold):
+    """Computes the average precision (AP) and average recall (AR).
+
+    Args:
+        groundtruth_coordinates: Coordinates of the ground-truth rectangles.
+        coordinates: Coordinates of the predicted rectangles.
+        iou_threshold: Intersection-over-union threshold used for matching.
+
+    Returns:
+        average_precision, average_recall, as well as the precision_recall_dict,
+        where precision_recall_dict holds the full precision/recall information
+        for each of the iou_threshold in the iou_threshold_range.
+
+    Raises:
+        ValueError: if the input groundtruth_info_dict and test_info_dict show inconsistent information.
+    """
+    # Start to build up the Matching instances for each of the image_id_*, which
+    # is to hold the IOU computation between the rectangle pairs for the same
+    # image_id_*.
+    if (len(groundtruth_coordinates) % 4 != 0) or (len(coordinates) % 4 != 0):
+        raise ValueError("groundtruth_info_dict and test_info_dict should hold only 4 * N numbers.")
+
+    groundtruth_rects = convert_to_rectangle_list(groundtruth_coordinates)
+    rects = convert_to_rectangle_list(coordinates)
+    matching = Matching(groundtruth_rects, rects)
+
+    groundtruth_rects_matched, rects_matched = matching.matching_by_greedy_assignment(iou_threshold)
+
+    image_statistics = compute_statistics_given_rectangle_matches(groundtruth_rects_matched, rects_matched)
+    image_statistics_list = [image_statistics]
+    return compute_precision_recall_given_image_statistics_list(iou_threshold, image_statistics_list)
