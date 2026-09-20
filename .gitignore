@@ -1,4 +1,38 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+env/
+
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Generated files
+runs/
+*.log
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+
+# Large model files
+*.pt
+*.onnx
+*.weights
+
+# Temporary files
+*.tmp
+*.temp

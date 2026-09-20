@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>SatQuery AI — Voice Assistant</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, Helvetica, sans-serif;
+
+            background:
+                radial-gradient(
+                    circle at top,
+                    #172554 0%,
+                    #020617 45%,
+                    #000000 100%
+                );
+
+            color: white;
+
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: min(900px, 92%);
+            text-align: center;
+        }
+
+        .satellite {
+            font-size: 70px;
+            margin-bottom: 10px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 42px;
+            letter-spacing: -1px;
+        }
+
+        .subtitle {
+            margin-top: 12px;
+            color: #94a3b8;
+            font-size: 17px;
+        }
+
+        .status {
+            margin: 35px auto 25px;
+            padding: 12px 20px;
+            width: fit-content;
+
+            border: 1px solid #334155;
+            border-radius: 999px;
+
+            background: rgba(15, 23, 42, 0.7);
+            color: #cbd5e1;
+
+            font-size: 14px;
+        }
+
+        .info {
+            margin-top: 30px;
+            color: #64748b;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+
+        .info strong {
+            color: #94a3b8;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+
+        <div class="satellite">
+            🛰️
+        </div>
+
+        <h1>SatQuery AI</h1>
+
+        <div class="subtitle">
+            Talk to your satellite imagery assistant
+        </div>
+
+        <div class="status">
+            🎙️ Click the voice button to start a live conversation
+        </div>
+
+        <div class="info">
+            <strong>Real-time voice mode</strong><br>
+            Speak naturally. You don't need to record and submit every sentence.<br>
+            You can interrupt the assistant while it is speaking.
+        </div>
+
+    </div>
+
+
+    <!-- Vapi Voice Widget -->
+    <script
+        src="https://unpkg.com/@vapi-ai/client-sdk-react/dist/embed/widget.umd.js"
+        async
+        type="text/javascript">
+    </script>
+
+
+    <vapi-widget
+        public-key="YOUR_VAPI_PUBLIC_KEY"
+        assistant-id="YOUR_VAPI_ASSISTANT_ID"
+        mode="voice"
+        size="compact"
+        theme="dark"
+        position="bottom-right">
+    </vapi-widget>
+
+
+</body>
+</html>

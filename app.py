@@ -9,11 +9,94 @@ load_dotenv()
 
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 import rasterio
 from google import genai
 from google.genai import types
 from ultralytics import YOLO
+
+# ============================================================
+# VEGETATION DETECTOR COMPATIBILITY
+# ============================================================
+# The existing vegetation_detector.py does not currently expose
+# `detect_vegetation`, so importing it directly crashes Streamlit.
+# Use the project's detector when available; otherwise fall back
+# to a local RGB/ExG detector so the application can still run.
+
+try:
+    from vegetation_detector import detect_vegetation
+except (ImportError, AttributeError):
+
+    def detect_vegetation(image_path):
+        """Fallback local RGB vegetation detector.
+
+        Returns the same fields expected by run_vegetation_detection()
+        and the Streamlit UI: coverage, regions and result_path.
+        """
+        import numpy as _np
+        from PIL import Image as _Image
+
+        image_path = str(image_path)
+        img = _np.asarray(
+            _Image.open(image_path).convert("RGB")
+        ).astype(_np.float32)
+
+        r = img[:, :, 0]
+        g = img[:, :, 1]
+        b = img[:, :, 2]
+
+        # Excess Green Index: vegetation generally has stronger
+        # relative green response than red/blue.
+        exg = 2.0 * g - r - b
+
+        # Adaptive threshold.
+        threshold = float(_np.percentile(exg, 70.0))
+        threshold = max(10.0, threshold)
+        mask = exg > threshold
+
+        # Reject very dark pixels to reduce false positives.
+        brightness = (r + g + b) / 3.0
+        mask &= brightness > 25.0
+
+        coverage = float(_np.mean(mask) * 100.0)
+
+        # Estimate vegetation regions using four image quadrants.
+        # This avoids adding another dependency just for connected
+        # component analysis.
+        h, w = mask.shape
+        h_mid = max(1, h // 2)
+        w_mid = max(1, w // 2)
+
+        quadrants = (
+            mask[:h_mid, :w_mid],
+            mask[:h_mid, w_mid:],
+            mask[h_mid:, :w_mid],
+            mask[h_mid:, w_mid:],
+        )
+
+        regions = sum(
+            1
+            for q in quadrants
+            if q.size > 0 and float(q.mean()) >= 0.01
+        )
+
+        # Create a simple visual vegetation mask for the UI.
+        # Vegetation = green, background = original image.
+        overlay = img.copy().astype(_np.uint8)
+        overlay[mask] = _np.array([40, 220, 80], dtype=_np.uint8)
+
+        result_path = Path(image_path).with_name(
+            Path(image_path).stem + "_vegetation_result.png"
+        )
+        _Image.fromarray(overlay).save(result_path)
+
+        return {
+            "coverage": coverage,
+            "regions": int(regions),
+            "result_path": str(result_path),
+            "method": "LOCAL RGB + ExG fallback",
+        }
 
 from building_detector import (
     load_model as load_building_model,
@@ -50,6 +133,16 @@ DETECTOR_IMAGE_SIZE = 1024
 BUILDING_MODEL_PATH = BASE_DIR / "models" / "building_model.onnx"
 BUILDING_THRESHOLD = 0.4371
 
+# ------------------------------------------------------------
+# VAPI / VOICE IMAGE SHARING
+# ------------------------------------------------------------
+# The FastAPI voice server runs as a separate process, so it cannot
+# read Streamlit session_state directly. We therefore keep a copy of
+# the currently uploaded RGB image in a stable shared file. The voice
+# server reads this same file when Vapi calls an analysis tool.
+VOICE_IMAGE_PATH = BASE_DIR / "runs" / "voice_current_image.png"
+VOICE_IMAGE_META_PATH = BASE_DIR / "runs" / "voice_current_image.json"
+
 # You can change this in the terminal:
 # set GEMINI_MODEL=your-model-name
 # NOTE: gemini-2.5-flash is no longer available to new API keys
@@ -66,6 +159,17 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 # it's still available to new API keys, which is what actually broke
 # the old fallback.
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
+
+# ------------------------------------------------------------
+# VAPI WEB VOICE
+# ------------------------------------------------------------
+# The public Vapi key is safe to use in the browser. Keep private
+# Vapi/API keys out of this file. Put VAPI_PUBLIC_KEY in .env.
+VAPI_PUBLIC_KEY = os.getenv("VAPI_PUBLIC_KEY", "")
+VAPI_ASSISTANT_ID = os.getenv(
+    "VAPI_ASSISTANT_ID",
+    "83901cfa-0da4-4c13-b1ec-5efefc692b5d",
+)
 
 
 # ============================================================
@@ -506,8 +610,17 @@ if "building_coverage" not in st.session_state:
 if "building_error" not in st.session_state:
     st.session_state.building_error = None
 
+if "vegetation_result" not in st.session_state:
+    st.session_state.vegetation_result = None
+
+if "vegetation_error" not in st.session_state:
+    st.session_state.vegetation_error = None
+
 if "ndvi_requested" not in st.session_state:
     st.session_state.ndvi_requested = False
+
+if "voice_image_sync_error" not in st.session_state:
+    st.session_state.voice_image_sync_error = None
 
 
 # ============================================================
@@ -706,6 +819,37 @@ def prepare_image_for_model(img, max_dim=1280):
     return img.resize(new_size, Image.LANCZOS)
 
 
+def sync_image_for_voice(image, original_name, original_size):
+    """
+    Save the currently uploaded image to the shared path used by the
+    FastAPI/Vapi voice backend. This keeps voice analysis synchronized
+    with the image currently visible in Streamlit.
+    """
+    try:
+        VOICE_IMAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save the RGB representation used by the local detectors.
+        image.convert("RGB").save(VOICE_IMAGE_PATH, format="PNG")
+
+        # Small metadata file is useful for debugging/status checks.
+        import json
+        metadata = {
+            "original_name": str(original_name),
+            "original_size": int(original_size),
+            "shared_image": str(VOICE_IMAGE_PATH),
+            "width": int(image.width),
+            "height": int(image.height),
+        }
+        VOICE_IMAGE_META_PATH.write_text(
+            json.dumps(metadata, indent=2),
+            encoding="utf-8",
+        )
+
+        return None
+    except Exception as e:
+        return str(e)
+
+
 # ============================================================
 # BUILDING DETECTION — HOTOSM
 # ============================================================
@@ -761,6 +905,28 @@ def run_building_detection(img):
 
     except Exception as e:
         return None, [], 0.0, str(e)
+
+
+# ============================================================
+# VEGETATION DETECTION — LOCAL RGB
+# ============================================================
+
+def run_vegetation_detection(img):
+    """Run the local RGB vegetation detector on the uploaded image."""
+    try:
+        output_dir = BASE_DIR / "runs"
+        output_dir.mkdir(exist_ok=True)
+        input_path = output_dir / "current_uploaded_rgb.png"
+
+        # The vegetation detector works on RGB/JPG/PNG pixels.
+        # Save the already-normalized uploaded image rather than using
+        # the unrelated fixed ndvi.tif raster.
+        img.convert("RGB").save(input_path, format="PNG")
+
+        result = detect_vegetation(str(input_path))
+        return result, None
+    except Exception as e:
+        return None, f"Vegetation detector error: {e}"
 
 
 # ============================================================
@@ -963,28 +1129,57 @@ def route_query(question):
         "storage tank", "track field", "soccer field", "swimming pool",
     )
 
-    gis_terms = (
-        "ndvi", "vegetation", "greenery", "plant", "plants", "crop",
-        "crops", "forest", "forests", "vegetated", "vegetation cover",
-        "vegetation coverage", "healthy vegetation", "dense vegetation",
-        "moderate vegetation", "qgis", "raster", "pixel",
+    vegetation_terms = (
+        "vegetation", "greenery", "plant", "plants", "tree", "trees",
+        "crop", "crops", "forest", "forests", "vegetated",
+        "vegetation cover", "vegetation coverage", "healthy vegetation",
+        "dense vegetation", "moderate vegetation", "green area",
+    )
+
+    ndvi_terms = (
+        "ndvi", "qgis", "raster", "pixel", "red band", "nir",
+        "near infrared", "near-infrared",
     )
 
     building_hit = any(term in q for term in building_terms)
     object_hit = any(term in q for term in object_terms)
     specific_object_hit = any(term in q for term in specific_object_terms)
-    gis_hit = any(term in q for term in gis_terms)
+    vegetation_hit = any(term in q for term in vegetation_terms)
+    ndvi_hit = any(term in q for term in ndvi_terms)
 
-    if building_hit and (specific_object_hit or gis_hit):
+    # Multiple local evidence sources = HYBRID. No Gemini is required
+    # unless the question is a genuine visual reasoning question.
+    if building_hit and (specific_object_hit or vegetation_hit or ndvi_hit):
         tools = ["HOTOSM BUILDING DETECTOR"]
         if specific_object_hit:
             tools.append("DOTA OBJECT DETECTOR")
-        if gis_hit:
+        if vegetation_hit:
+            tools.append("LOCAL VEGETATION DETECTOR")
+        if ndvi_hit:
             tools.append("QGIS / NDVI")
         return {
             "route": "HYBRID",
             "tools": tools,
-            "reason": "The question combines building detection with another analysis source.",
+            "reason": "The question combines building detection with another local analysis source.",
+        }
+
+    if object_hit and (vegetation_hit or ndvi_hit):
+        tools = ["DOTA OBJECT DETECTOR"]
+        if vegetation_hit:
+            tools.append("LOCAL VEGETATION DETECTOR")
+        if ndvi_hit:
+            tools.append("QGIS / NDVI")
+        return {
+            "route": "HYBRID",
+            "tools": tools,
+            "reason": "The question combines object detection with vegetation or GIS evidence.",
+        }
+
+    if vegetation_hit and ndvi_hit:
+        return {
+            "route": "HYBRID",
+            "tools": ["LOCAL VEGETATION DETECTOR", "QGIS / NDVI"],
+            "reason": "The question asks for both RGB vegetation evidence and NDVI/GIS evidence.",
         }
 
     if building_hit:
@@ -998,14 +1193,21 @@ def route_query(question):
         return {
             "route": "OBJECT",
             "tools": ["DOTA OBJECT DETECTOR"],
-            "reason": "The question can be answered directly from the local object-detector results.",
+            "reason": "The question is primarily about detected objects or object counts.",
         }
 
-    if gis_hit:
+    if vegetation_hit:
+        return {
+            "route": "VEGETATION",
+            "tools": ["LOCAL VEGETATION DETECTOR"],
+            "reason": "The question is primarily about visible vegetation in the uploaded RGB image.",
+        }
+
+    if ndvi_hit:
         return {
             "route": "GIS",
             "tools": ["QGIS / NDVI"],
-            "reason": "The question can be answered directly from the local NDVI/GIS statistics.",
+            "reason": "The question can be answered directly from the connected NDVI/GIS statistics.",
         }
 
     return {
@@ -1015,50 +1217,32 @@ def route_query(question):
     }
 
 
-def local_fast_answer(route_info, question, stats, detections, building_detections=None, building_coverage=0.0):
-    """
-    Answer evidence-based OBJECT/GIS/HYBRID questions locally.
-
-    This avoids a Gemini API call when the required answer is already
-    present in the detector output or NDVI statistics.
-    Returns None when the question needs actual visual reasoning.
-    """
+def local_fast_answer(route_info, question, stats, detections, building_detections=None, building_coverage=0.0, vegetation_result=None):
+    """Answer questions that have sufficient local detector/GIS evidence."""
     route = route_info["route"]
     q = question.lower().strip()
 
     def object_answer():
-        counts = summarize_detections(detections or {})
-
+        counts = summarize_detections(detections or [])
         if not counts:
             return (
                 f"🛰️ **No objects were detected above the detector "
                 f"confidence threshold ({DETECTOR_CONFIDENCE:.2f}).**"
             )
 
-        # If the user asks for a specific object type, report only those.
         aliases = {
-            "plane": ["plane"],
-            "planes": ["plane"],
-            "aircraft": ["plane"],
+            "plane": ["plane"], "planes": ["plane"], "aircraft": ["plane"],
             "vehicle": ["large vehicle", "small vehicle"],
             "vehicles": ["large vehicle", "small vehicle"],
-            "ship": ["ship"],
-            "ships": ["ship"],
-            "tank": ["storage tank"],
-            "tanks": ["storage tank"],
-            "helicopter": ["helicopter"],
-            "helicopters": ["helicopter"],
-            "bridge": ["bridge"],
-            "harbor": ["harbor"],
-            "airport": ["plane"],
-            "tennis court": ["tennis court"],
+            "ship": ["ship"], "ships": ["ship"],
+            "tank": ["storage tank"], "tanks": ["storage tank"],
+            "helicopter": ["helicopter"], "helicopters": ["helicopter"],
+            "bridge": ["bridge"], "harbor": ["harbor"],
+            "airport": ["plane"], "tennis court": ["tennis court"],
             "basketball court": ["basketball court"],
-            "baseball diamond": ["baseball diamond"],
-            "roundabout": ["roundabout"],
-            "storage tank": ["storage tank"],
-            "track field": ["ground track field"],
-            "soccer field": ["soccer ball field"],
-            "swimming pool": ["swimming pool"],
+            "baseball diamond": ["baseball diamond"], "roundabout": ["roundabout"],
+            "storage tank": ["storage tank"], "track field": ["ground track field"],
+            "soccer field": ["soccer ball field"], "swimming pool": ["swimming pool"],
         }
 
         requested = []
@@ -1069,37 +1253,46 @@ def local_fast_answer(route_info, question, stats, detections, building_detectio
                         requested.append(cls)
 
         if requested:
-            lines = []
-            for cls in requested:
-                lines.append(f"- **{cls.title()}**: {counts.get(cls, 0)}")
+            lines = [f"- **{cls.title()}**: {counts.get(cls, 0)}" for cls in requested]
             return "🛩️ **Object detection result**\n\n" + "\n".join(lines)
 
-        lines = [
-            f"- **{name.title()}**: {count}"
-            for name, count in sorted(counts.items())
-        ]
-        return (
-            f"🛰️ **{len(detections)} objects detected**\n\n"
-            + "\n".join(lines)
-        )
+        lines = [f"- **{name.title()}**: {count}" for name, count in sorted(counts.items())]
+        return f"🛰️ **{len(detections)} objects detected**\n\n" + "\n".join(lines)
 
     def building_answer():
         buildings = building_detections or []
-
         if building_detections is None:
             return "🏠 **Building detector data is not available.**"
-
         return (
             f"🏠 **{len(buildings)} building regions detected.**\n\n"
             f"Estimated building coverage: **{building_coverage:.1f}%**.\n\n"
             f"Model threshold: **{BUILDING_THRESHOLD:.4f}**."
         )
 
+    def vegetation_answer():
+        if vegetation_result is None:
+            return "🌱 **Vegetation detector data is not available.**"
+
+        coverage = float(vegetation_result.get("coverage", 0.0))
+        regions = int(vegetation_result.get("regions", 0))
+
+        if coverage <= 0:
+            return (
+                "🌱 **No vegetation regions were detected by the local RGB detector.**\n\n"
+                "This is an RGB-based estimate, not NDVI."
+            )
+
+        return (
+            f"🌱 **Visible vegetation detected.**\n\n"
+            f"Estimated RGB vegetation coverage: **{coverage:.1f}%**.\n\n"
+            f"Detected vegetation regions: **{regions}**.\n\n"
+            "Gemini was **not used** for this vegetation result. "
+            "This is not NDVI."
+        )
 
     def gis_answer():
         if not stats:
             return "🌱 **NDVI data is not available.** The connected `ndvi.tif` could not be read."
-
         mean = stats["mean_ndvi"]
         minimum = stats["min_ndvi"]
         maximum = stats["max_ndvi"]
@@ -1113,10 +1306,10 @@ def local_fast_answer(route_info, question, stats, detections, building_detectio
                 region = stats["regions"].get(highest)
                 return (
                     f"🌱 **Vegetation is most concentrated in the {highest} half** "
-                    f"of the raster, with about {region['vegetation_percentage']:.1f}% "
+                    f"of the connected NDVI raster, with about {region['vegetation_percentage']:.1f}% "
                     f"of valid pixels at NDVI ≥ 0.30."
                 )
-            return "🌱 A highest-vegetation region could not be determined."
+            return "🌱 A highest-vegetation region could not be determined from the NDVI raster."
 
         if "is there vegetation" in q or q.startswith("is there"):
             return (
@@ -1128,8 +1321,7 @@ def local_fast_answer(route_info, question, stats, detections, building_detectio
 
         if "how much vegetation" in q or "vegetation percentage" in q or "vegetation coverage" in q:
             return (
-                f"🌱 **Vegetation coverage: {veg:.1f}%** "
-                f"(NDVI ≥ 0.30).\n\n"
+                f"🌱 **NDVI vegetation coverage: {veg:.1f}%** (NDVI ≥ 0.30).\n\n"
                 f"Moderate threshold (≥ 0.40): **{moderate:.1f}%**\n\n"
                 f"Dense threshold (≥ 0.50): **{dense:.1f}%**"
             )
@@ -1148,37 +1340,25 @@ def local_fast_answer(route_info, question, stats, detections, building_detectio
 
     if route == "BUILDING":
         return building_answer()
-
     if route == "OBJECT":
         return object_answer()
-
+    if route == "VEGETATION":
+        return vegetation_answer()
     if route == "GIS":
         return gis_answer()
 
     if route == "HYBRID":
         parts = []
-
-        if any(term in q for term in (
-            "building", "buildings", "house", "houses",
-            "structure", "structures",
-        )):
+        tools = route_info.get("tools", [])
+        if "HOTOSM BUILDING DETECTOR" in tools:
             parts.append(building_answer())
-
-        if any(term in q for term in (
-            "plane", "planes", "aircraft", "vehicle", "vehicles",
-            "ship", "ships", "tank", "tanks", "harbor", "bridge",
-            "helicopter", "helicopters", "airport", "object", "objects",
-        )):
+        if "DOTA OBJECT DETECTOR" in tools:
             parts.append(object_answer())
-
-        if any(term in q for term in (
-            "ndvi", "vegetation", "greenery", "plant", "plants",
-            "crop", "crops", "forest", "forests", "vegetation cover",
-            "qgis", "raster", "pixel",
-        )):
+        if "LOCAL VEGETATION DETECTOR" in tools:
+            parts.append(vegetation_answer())
+        if "QGIS / NDVI" in tools:
             parts.append(gis_answer())
-
-        return "\n\n---\n\n".join(parts)
+        return "\n\n---\n\n".join(parts) if parts else None
 
     return None
 
@@ -1196,7 +1376,8 @@ Reason: {route_info['reason']}
 Use the selected evidence sources above. The router is a routing aid,
 not evidence itself. For exact object counts, use the DOTA detector result.
 For building counts, use the HOTOSM building detector result.
-For NDVI/vegetation measurements, use the supplied QGIS raster statistics.
+For visible vegetation questions, use the local RGB vegetation detector result.
+For NDVI/GIS measurements, use the supplied QGIS raster statistics.
 For visual interpretation, inspect the uploaded image.
 """
 
@@ -1419,6 +1600,120 @@ html_block(
 
 
 # ============================================================
+# VAPI WEB VOICE WIDGET
+# ============================================================
+
+def render_vapi_voice_widget():
+    """
+    Render a button that opens the SatQuery AI voice assistant in a new
+    browser tab, rather than embedding the <vapi-widget> inline inside
+    Streamlit's components.html iframe.
+
+    Why: components.html renders content inside a sandboxed iframe.
+    Voice widgets need microphone access via getUserMedia(), and that
+    permission behaves unreliably (often silently denied) for content
+    running inside a nested/sandboxed iframe -- the widget loads and
+    looks fine, but the call never actually connects.
+
+    A real top-level browser tab has none of those sandbox
+    restrictions, so microphone access works normally there. We open
+    one using a Blob URL, generated entirely client-side (no extra
+    backend route needed). Streamlit's iframe sandbox policy already
+    includes "allow-popups" and "allow-popups-to-escape-sandbox", so
+    window.open() from inside components.html works and the new tab
+    is NOT sandboxed by the parent iframe's restrictions.
+    """
+    if not VAPI_PUBLIC_KEY:
+        st.warning(
+            "🎙️ Voice assistant is not configured yet. Add "
+            "`VAPI_PUBLIC_KEY=...` to your `.env` file and restart SatQuery."
+        )
+        return
+
+    # This is the full standalone page that will be opened in the new tab.
+    widget_page_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SatQuery AI Voice Assistant</title>
+  <style>
+    html, body {{
+      margin:0;
+      height:100%;
+      background:#0A0E14;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-family:'Space Grotesk', sans-serif;
+    }}
+  </style>
+</head>
+<body>
+  <vapi-widget
+    public-key="{VAPI_PUBLIC_KEY}"
+    assistant-id="{VAPI_ASSISTANT_ID}"
+    mode="voice"
+    size="full"
+    theme="dark">
+  </vapi-widget>
+  <script
+    src="https://unpkg.com/@vapi-ai/client-sdk-react/dist/embed/widget.umd.js"
+    async
+    type="text/javascript">
+  </script>
+</body>
+</html>"""
+
+    # Escape backticks/script-closing tags so this safely nests inside
+    # the JS template literal in launcher_html below.
+    escaped_html = (
+        widget_page_html
+        .replace("\\", "\\\\")
+        .replace("`", "\\`")
+        .replace("</script>", "<\\/script>")
+    )
+
+    launcher_html = f"""
+    <div style="width:100%; display:flex; flex-direction:column; align-items:center; gap:0.5rem; padding:0.75rem 0;">
+      <button id="satquery-voice-btn" style="
+          background:#10151D; color:#E8A33D; border:1px solid #3A4552;
+          font-family:'IBM Plex Mono', monospace; font-size:0.85rem;
+          padding:0.75rem 1.6rem; cursor:pointer;">
+        🎙️ Start voice call with SatQuery AI
+      </button>
+      <div id="satquery-voice-note" style="
+          font-family:'IBM Plex Mono', monospace; font-size:0.72rem;
+          color:#7C8A9A;">
+        Opens in a new tab so your microphone permission works correctly.
+      </div>
+    </div>
+    <script>
+      (function () {{
+        var btn = document.getElementById('satquery-voice-btn');
+        var note = document.getElementById('satquery-voice-note');
+        btn.addEventListener('click', function () {{
+          try {{
+            var html = `{escaped_html}`;
+            var blob = new Blob([html], {{ type: 'text/html' }});
+            var url = URL.createObjectURL(blob);
+            var win = window.open(url, '_blank');
+            if (!win) {{
+              note.textContent = 'Your browser blocked the popup. Please allow popups for this site and click the button again.';
+              note.style.color = '#C9614F';
+            }}
+          }} catch (err) {{
+            note.textContent = 'Could not open the voice assistant: ' + err;
+            note.style.color = '#C9614F';
+          }}
+        }});
+      }})();
+    </script>
+    """
+
+    components.html(launcher_html, height=110, scrolling=False)
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
@@ -1506,6 +1801,18 @@ if st.session_state.image_key != image_key:
             str(NDVI_PATH)
         )
 
+        # ----------------------------------------------------
+        # SYNC CURRENT IMAGE TO THE VOICE BACKEND
+        # ----------------------------------------------------
+        # FastAPI/Vapi runs outside Streamlit, so give it a stable
+        # shared file containing the same RGB image the user just
+        # uploaded.
+        st.session_state.voice_image_sync_error = sync_image_for_voice(
+            image,
+            uploaded_file.name,
+            uploaded_file.size,
+        )
+
         # Do not run any expensive specialist detector just because an image
         # was uploaded. Detectors are triggered lazily when the user asks a
         # question that actually needs them.
@@ -1517,6 +1824,8 @@ if st.session_state.image_key != image_key:
         st.session_state.building_detection_image = None
         st.session_state.building_coverage = 0.0
         st.session_state.building_error = None
+        st.session_state.vegetation_result = None
+        st.session_state.vegetation_error = None
         st.session_state.ndvi_requested = False
 
     except Exception as e:
@@ -1547,19 +1856,39 @@ with right:
             <div class="console-row"><span>File</span><b>{uploaded_file.name}</b></div>
             <div class="console-row"><span>Dimensions</span><b>{image.width} × {image.height}</b></div>
             <div class="console-row"><span>Vision model</span><b style="color:var(--green)">READY</b></div>
+            <div class="console-row"><span>Voice image</span><b style="color:{'var(--green)' if VOICE_IMAGE_PATH.exists() and not st.session_state.voice_image_sync_error else 'var(--red)'}">{'SYNCED' if VOICE_IMAGE_PATH.exists() and not st.session_state.voice_image_sync_error else 'OFFLINE'}</b></div>
         </div>
         """
     )
 
+    if st.session_state.voice_image_sync_error:
+        st.warning(
+            "Voice image sync failed: "
+            + st.session_state.voice_image_sync_error
+        )
+
 
 # ============================================================
-# STEP 3 — OBJECT DETECTION
+# STEP 03 — REAL-TIME VOICE ASSISTANT
+# ============================================================
+
+panel_head("STEP 03", "Talk to SatQuery AI")
+
+st.markdown(
+    "Ask naturally about the uploaded image. The voice assistant uses the "
+    "same synchronized image as the specialist analysis tools.",
+)
+render_vapi_voice_widget()
+
+
+# ============================================================
+# STEP 4 — OBJECT DETECTION
 # ============================================================
 
 # Object detection is intentionally hidden until the user asks an
 # object-related question.
 if st.session_state.detections is not None:
-    panel_head("STEP 03", "Satellite object detection")
+    panel_head("STEP 04", "Satellite object detection")
 
     detections = st.session_state.detections
     detection_image = st.session_state.detection_image
@@ -1639,12 +1968,56 @@ if st.session_state.building_detection_image is not None:
         )
 
 # ============================================================
+# STEP 03C — LOCAL VEGETATION DETECTION
+# ============================================================
+
+# Vegetation detection is intentionally hidden until the user asks
+# a vegetation-related question. Uploading an image alone never runs it.
+if st.session_state.vegetation_result is not None:
+    panel_head("STEP 03C", "Local vegetation detection")
+
+    veg_result = st.session_state.vegetation_result
+    veg_error = st.session_state.vegetation_error
+
+    if veg_error:
+        st.warning(veg_error)
+    else:
+        veg_left, veg_right = st.columns([2.2, 1])
+
+        with veg_left:
+            result_path = veg_result.get("result_path")
+            if result_path and Path(result_path).exists():
+                st.image(
+                    result_path,
+                    caption="Local RGB vegetation detection output",
+                    use_container_width=True,
+                )
+
+        with veg_right:
+            html_block(
+                f"""
+                <div class="console-panel">
+                    <div class="panel-label">VEGETATION DETECTION STATUS</div>
+                    <div class="console-row"><span>Coverage</span><b>{veg_result.get('coverage', 0.0):.1f}%</b></div>
+                    <div class="console-row"><span>Regions</span><b>{veg_result.get('regions', 0)}</b></div>
+                    <div class="console-row"><span>Method</span><b>LOCAL RGB + HSV + ExG + WATER REJECTION</b></div>
+                    <div class="console-row"><span>Gemini</span><b>NOT USED</b></div>
+                </div>
+                """
+            )
+
+            st.caption(
+                "Visible vegetation is estimated locally from the uploaded RGB image. "
+                "This is not NDVI and Gemini is not used."
+            )
+
+# ============================================================
 # STEP 4 — GIS
 # ============================================================
 
 # GIS/NDVI results are shown only after the user asks a GIS/NDVI question.
 if st.session_state.ndvi_requested:
-    panel_head("STEP 04", "GIS / NDVI analysis")
+    panel_head("STEP 05", "GIS / NDVI analysis")
 
     if ndvi_stats:
         html_block(
@@ -1722,7 +2095,7 @@ if st.session_state.ndvi_requested:
 # STEP 5 — CHAT
 # ============================================================
 
-panel_head("STEP 05", "Ask SatQuery AI")
+panel_head("STEP 06", "Ask SatQuery AI")
 
 st.caption("Ask multiple questions about the same uploaded image. SatQuery automatically routes each question to the relevant analysis tools.")
 
@@ -1730,7 +2103,7 @@ example_questions = [
     "How many planes or vehicles were detected?",
     "What objects were detected?",
     "Is there vegetation?",
-    "Where is the vegetation concentrated?",
+    "Is there vegetation in this image?",
     "What is the NDVI of this area?",
     "How much vegetation is there?",
     "How many planes are there and what is the vegetation condition?",
@@ -1810,7 +2183,8 @@ if question:
     route_label = {
         "BUILDING": "🏠 BUILDING DETECTOR · LOCAL",
         "OBJECT": "🛩️ OBJECT DETECTOR · LOCAL",
-        "GIS": "🌱 QGIS / NDVI · LOCAL",
+        "GIS": "🗺️ QGIS / NDVI · LOCAL",
+        "VEGETATION": "🌱 VEGETATION DETECTOR · LOCAL",
         "HYBRID": "🛰️ HYBRID · LOCAL",
         "VISION": "🧠 GEMINI VISION",
     }.get(route_info["route"], route_info["route"])
@@ -1871,6 +2245,14 @@ if question:
                         st.session_state.detections = detections
                         st.session_state.detection_error = detection_error
 
+        # Local RGB vegetation detector: run ONLY when the question needs it.
+        if "LOCAL VEGETATION DETECTOR" in route_info.get("tools", []):
+            if st.session_state.vegetation_result is None and st.session_state.vegetation_error is None:
+                with st.spinner("🌱 Analyzing vegetation in the uploaded image..."):
+                    vegetation_result, vegetation_error = run_vegetation_detection(image)
+                st.session_state.vegetation_result = vegetation_result
+                st.session_state.vegetation_error = vegetation_error
+
         # Fast path: use data that has now been computed locally.
         # No detector runs unless the question requested that evidence.
         answer = local_fast_answer(
@@ -1880,6 +2262,7 @@ if question:
             detections=st.session_state.detections,
             building_detections=st.session_state.building_detections,
             building_coverage=st.session_state.building_coverage,
+            vegetation_result=st.session_state.vegetation_result,
         )
 
         if answer is not None:
@@ -1937,6 +2320,25 @@ if question:
                 st.caption(
                     f"Building regions detected: {len(st.session_state.building_detections or [])} "
                     f"· Coverage: {st.session_state.building_coverage:.1f}%"
+                )
+
+        # Show vegetation evidence only when the user's question triggered it.
+        if "LOCAL VEGETATION DETECTOR" in route_info.get("tools", []):
+            veg_result = st.session_state.vegetation_result
+            veg_error = st.session_state.vegetation_error
+            if veg_error:
+                st.warning(veg_error)
+            elif veg_result is not None:
+                result_path = veg_result.get("result_path")
+                if result_path and Path(result_path).exists():
+                    st.image(
+                        result_path,
+                        caption="Local RGB vegetation detection output",
+                        use_container_width=True,
+                    )
+                st.caption(
+                    f"RGB vegetation coverage: {veg_result.get('coverage', 0.0):.1f}% "
+                    f"· Regions: {veg_result.get('regions', 0)} · Gemini: NOT USED"
                 )
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
