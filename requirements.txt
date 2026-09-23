@@ -8,3 +8,5 @@ ultralytics
 onnxruntime
 fastapi
 uvicorn
+python-multipart
+requests
