@@ -3,5 +3,5 @@ python-dotenv
 numpy
 Pillow
 rasterio
-google-genai
+google-genai>=2.9.0
 ultralytics
