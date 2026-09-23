@@ -1,3 +1,7 @@
 streamlit
 python-dotenv
+numpy
+Pillow
 rasterio
+google-genai
+ultralytics
