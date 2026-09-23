@@ -5,3 +5,4 @@ Pillow
 rasterio
 google-genai>=2.9.0
 ultralytics
+onnxruntime
