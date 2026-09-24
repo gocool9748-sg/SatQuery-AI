@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import random
 from pathlib import Path
@@ -188,7 +189,7 @@ st.markdown(
         --border:#232B36;
         --border-bright:#3A4552;
         --text:#E8ECF1;
-        --text-dim:#7C8A9A;
+        --text-dim:#93A1B1;
         --amber:#E8A33D;
         --amber-dim:rgba(232,163,61,0.12);
         --green:#4CAF7D;
@@ -508,6 +509,51 @@ st.markdown(
         font-size:0.72rem;
         color:var(--text-dim);
         padding-top:0.3rem;
+    }
+
+    /* ---------- UI UPDATE: layout / tabs / downloads ---------- */
+    /* keep the last content clear of the pinned chat bar */
+    .block-container, [data-testid="stMainBlockContainer"]{
+        padding-bottom:9rem !important;
+    }
+    .stat-grid.auto{
+        grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
+    }
+    .stTabs [data-baseweb="tab-list"]{
+        gap:0.3rem;
+        border-bottom:1px solid var(--border);
+    }
+    .stTabs [data-baseweb="tab"]{
+        background:transparent;
+        border-radius:0;
+        padding:0.5rem 0.9rem;
+        font-family:'IBM Plex Mono', monospace;
+        font-size:0.8rem;
+        color:var(--text-dim);
+    }
+    .stTabs [data-baseweb="tab"] p{
+        color:inherit !important;
+        font-family:inherit !important;
+        font-size:inherit !important;
+    }
+    .stTabs [aria-selected="true"],
+    .stTabs [aria-selected="true"] p{
+        color:var(--amber) !important;
+    }
+    .stTabs [data-baseweb="tab-highlight"]{
+        background-color:var(--amber) !important;
+    }
+    .stDownloadButton>button{
+        background:var(--panel) !important;
+        color:var(--text) !important;
+        border:1px solid var(--border-bright) !important;
+        border-radius:0 !important;
+        font-family:'IBM Plex Mono', monospace !important;
+        font-size:0.78rem !important;
+    }
+    .stDownloadButton>button:hover{
+        border-color:var(--amber) !important;
+        color:var(--amber) !important;
     }
 
     footer, #MainMenu{ visibility:hidden; }
@@ -832,7 +878,6 @@ def sync_image_for_voice(image, original_name, original_size):
         image.convert("RGB").save(VOICE_IMAGE_PATH, format="PNG")
 
         # Small metadata file is useful for debugging/status checks.
-        import json
         metadata = {
             "original_name": str(original_name),
             "original_size": int(original_size),
@@ -1600,28 +1645,375 @@ html_block(
 
 
 # ============================================================
-# VAPI WEB VOICE WIDGET
+# VAPI WEB VOICE WIDGET (INLINE, TAP-TO-TALK)
 # ============================================================
+#
+# Why a custom component instead of components.html():
+# components.html() renders inside an iframe whose origin is "null".
+# Vapi's audio engine (Daily) calls postMessage() with the page's
+# origin and crashes with "Invalid target origin 'null'". A Streamlit
+# custom component is served from a real URL (http://localhost:8501/...)
+# so it has a proper origin, and it stays inline on the same page.
+#
+# The component's index.html is written automatically to
+# ./voice_component/index.html on startup -- nothing to copy by hand.
+
+VOICE_COMPONENT_DIR = BASE_DIR / "voice_component"
+
+VOICE_COMPONENT_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root{
+    --bg:#0A0E14; --panel:#10151D; --border:#232B36; --border-bright:#3A4552;
+    --text:#E8ECF1; --dim:#7C8A9A; --amber:#E8A33D; --green:#4CAF7D; --red:#C9614F;
+  }
+  *{ box-sizing:border-box; }
+  html, body{ margin:0; background:transparent; color:var(--text);
+    font-family:'IBM Plex Mono', monospace; }
+  .wrap{
+    display:flex; flex-direction:column; align-items:center; gap:0.7rem;
+    padding:0.6rem 0 0.2rem 0;
+  }
+  .row{ display:flex; align-items:center; gap:1rem; }
+
+  #mic{
+    width:84px; height:84px; border-radius:50%;
+    background:var(--panel); color:var(--amber);
+    border:2px solid var(--border-bright);
+    font-size:2rem; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    transition:border-color .15s ease, background .15s ease, transform .1s ease;
+  }
+  #mic:hover{ border-color:var(--amber); }
+  #mic:active{ transform:scale(0.96); }
+  #mic.connecting{ border-color:var(--amber); animation:pulse 1s infinite; }
+  #mic.live{
+    background:rgba(76,175,125,0.12); border-color:var(--green); color:var(--green);
+    animation:ring 1.6s infinite;
+  }
+  #mic.speaking{
+    background:rgba(232,163,61,0.14); border-color:var(--amber); color:var(--amber);
+    animation:ring-amber 1.2s infinite;
+  }
+  #mic.error{ border-color:var(--red); color:var(--red); }
+
+  #mute{
+    width:44px; height:44px; border-radius:50%;
+    background:var(--panel); color:var(--text);
+    border:1px solid var(--border-bright); font-size:1.05rem; cursor:pointer;
+    display:none;
+  }
+  #mute.show{ display:block; }
+  #mute.muted{ border-color:var(--red); color:var(--red); }
+
+  @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.45} }
+  @keyframes ring{
+    0%{ box-shadow:0 0 0 0 rgba(76,175,125,.55); }
+    100%{ box-shadow:0 0 0 22px rgba(76,175,125,0); }
+  }
+  @keyframes ring-amber{
+    0%{ box-shadow:0 0 0 0 rgba(232,163,61,.55); }
+    100%{ box-shadow:0 0 0 22px rgba(232,163,61,0); }
+  }
+
+  #status{ font-size:.82rem; color:var(--dim); letter-spacing:.02em;
+    text-align:center; max-width:95%; word-break:break-word; }
+  #status b{ color:var(--text); }
+
+  #vol{ width:180px; height:4px; background:var(--border); overflow:hidden; }
+  #vol > div{ height:100%; width:0%; background:var(--green); transition:width .08s linear; }
+
+  #log{
+    width:100%; max-height:200px; overflow-y:auto;
+    border:1px solid var(--border); background:var(--panel);
+    padding:.5rem .7rem; font-size:.78rem; line-height:1.55; color:var(--dim);
+    display:none;
+  }
+  #log > div{ padding:.3rem .6rem; margin:.25rem 0; border-left:2px solid var(--border-bright); }
+  #log .u{ color:var(--text); border-left-color:var(--text); }
+  #log .a{ color:var(--amber); border-left-color:var(--amber); }
+  #log .live{ opacity:.55; font-style:italic; }
+  @keyframes think{ 0%,100%{opacity:1} 50%{opacity:.4} }
+  #mic.thinking{
+    background:rgba(232,163,61,0.10); border-color:var(--amber); color:var(--amber);
+    animation:think 1s infinite;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row">
+    <button id="mic" title="Tap to talk">🎙️</button>
+    <button id="mute" title="Mute / unmute your microphone">🔊</button>
+  </div>
+  <div id="vol"><div></div></div>
+  <div id="status">Tap the mic to <b>start talking</b> with SatQuery AI</div>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+  // ---------- Streamlit component protocol (minimal) ----------
+  function sendToStreamlit(type, data){
+    window.parent.postMessage(
+      Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*"
+    );
+  }
+
+  let PUBLIC_KEY = "";
+  let ASSISTANT_ID = "";
+
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (msg && msg.type === "streamlit:render"){
+      const args = msg.args || {};
+      PUBLIC_KEY = args.public_key || "";
+      ASSISTANT_ID = args.assistant_id || "";
+    }
+  });
+
+  sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+  const H_IDLE = 230, H_LOG = 440;
+  function setFrameHeight(h){ sendToStreamlit("streamlit:setFrameHeight", { height: h }); }
+  setFrameHeight(H_IDLE);
+
+  // ---------- UI ----------
+  const micBtn = document.getElementById('mic');
+  const muteBtn = document.getElementById('mute');
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const volBar = document.querySelector('#vol > div');
+
+  let vapi = null;
+  let inCall = false;
+  let starting = false;
+  let muted = false;
+
+  function setStatus(html){ statusEl.innerHTML = html; }
+  function setMicState(cls){ micBtn.className = cls || ''; }
+
+  let liveEl = null;
+
+  function showLog(){
+    if (logEl.style.display !== 'block'){
+      logEl.style.display = 'block';
+      setFrameHeight(H_LOG);
+    }
+  }
+
+  function clearLive(){
+    if (liveEl){ liveEl.remove(); liveEl = null; }
+  }
+
+  function addLine(role, text, live){
+    showLog();
+    const prefix = (role === 'user' ? 'You: ' : 'SatQuery: ');
+    if (live){
+      if (!liveEl){ liveEl = document.createElement('div'); logEl.appendChild(liveEl); }
+      liveEl.className = (role === 'user' ? 'u' : 'a') + ' live';
+      liveEl.textContent = prefix + text;
+    } else {
+      clearLive();
+      const div = document.createElement('div');
+      div.className = role === 'user' ? 'u' : 'a';
+      div.textContent = prefix + text;
+      logEl.appendChild(div);
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function resetUI(){
+    inCall = false;
+    starting = false;
+    muted = false;
+    setMicState('');
+    micBtn.textContent = '🎙️';
+    muteBtn.classList.remove('show', 'muted');
+    muteBtn.textContent = '🔊';
+    volBar.style.width = '0%';
+  }
+
+  function errText(e){
+    if (!e) return 'unknown error';
+    if (typeof e === 'string') return e;
+    return e.errorMsg || (e.error && e.error.message) || e.message || JSON.stringify(e);
+  }
+
+  async function loadVapi(){
+    if (vapi) return vapi;
+
+    // Try two CDNs in case one is blocked on the user's network.
+    const sources = [
+      'https://esm.sh/@vapi-ai/web',
+      'https://cdn.jsdelivr.net/npm/@vapi-ai/web/+esm',
+    ];
+    let mod = null, lastErr = null;
+    for (const src of sources){
+      try { mod = await import(src); break; }
+      catch (e){ lastErr = e; }
+    }
+    if (!mod) throw new Error('Could not load the Vapi SDK (' + lastErr + ')');
+
+    let Vapi = mod.default || mod.Vapi;
+    if (Vapi && Vapi.default) Vapi = Vapi.default;  // handle CJS interop
+    vapi = new Vapi(PUBLIC_KEY);
+
+    vapi.on('call-start', () => {
+      inCall = true; starting = false;
+      setMicState('live');
+      micBtn.textContent = '⏹';
+      muteBtn.classList.add('show');
+      setStatus('<b style="color:var(--green)">LISTENING</b> — go ahead and talk. Tap ⏹ to end.');
+    });
+
+    vapi.on('call-end', () => {
+      resetUI();
+      setStatus('Call ended. Tap the mic to <b>talk again</b>.');
+    });
+
+    vapi.on('speech-start', () => {
+      setMicState('speaking');
+      setStatus('<b style="color:var(--amber)">SATQUERY IS SPEAKING</b>');
+    });
+
+    vapi.on('speech-end', () => {
+      if (inCall){
+        setMicState('live');
+        setStatus('<b style="color:var(--green)">LISTENING</b> — go ahead and talk. Tap ⏹ to end.');
+      }
+    });
+
+    vapi.on('volume-level', (v) => {
+      volBar.style.width = Math.min(100, Math.round(v * 100)) + '%';
+    });
+
+    vapi.on('message', (m) => {
+      if (!m) return;
+
+      // live + final transcript lines
+      if (m.type === 'transcript' && m.transcript){
+        addLine(m.role, m.transcript, m.transcriptType !== 'final');
+        return;
+      }
+
+      // the assistant is running the image-analysis tools
+      if (m.type === 'tool-calls' || m.type === 'function-call'){
+        setMicState('thinking');
+        setStatus('<b style="color:var(--amber)">ANALYZING IMAGE</b> — running the specialist tools…');
+        return;
+      }
+
+      if (m.type === 'tool-calls-result' && inCall){
+        setMicState('live');
+      }
+    });
+
+    vapi.on('error', (e) => {
+      console.error('Vapi error', e);
+      resetUI();
+      setMicState('error');
+      setStatus('<b style="color:var(--red)">Voice error:</b> ' + errText(e));
+    });
+
+    return vapi;
+  }
+
+  async function startCall(){
+    if (starting || inCall) return;
+
+    if (!PUBLIC_KEY || !ASSISTANT_ID){
+      setMicState('error');
+      setStatus('<b style="color:var(--red)">Voice not configured yet.</b> Reload the page and try again.');
+      return;
+    }
+
+    starting = true;
+    setMicState('connecting');
+    setStatus('Connecting… <b>allow the microphone</b> if your browser asks.');
+
+    // Ask for mic permission up front so failures give a clear message.
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(t => t.stop());
+    } catch (e){
+      resetUI();
+      setMicState('error');
+      setStatus(
+        '<b style="color:var(--red)">Microphone blocked.</b> Click the 🔒 icon in the ' +
+        'address bar → allow Microphone for this site, then tap the mic again.'
+      );
+      return;
+    }
+
+    try {
+      const v = await loadVapi();
+      await v.start(ASSISTANT_ID);
+    } catch (e){
+      resetUI();
+      setMicState('error');
+      setStatus('<b style="color:var(--red)">Could not start:</b> ' + errText(e));
+    }
+  }
+
+  function endCall(){
+    try { if (vapi) vapi.stop(); } catch (e){ console.error(e); }
+    resetUI();
+    setStatus('Call ended. Tap the mic to <b>talk again</b>.');
+  }
+
+  micBtn.addEventListener('click', () => {
+    if (inCall || starting){ endCall(); } else { startCall(); }
+  });
+
+  muteBtn.addEventListener('click', () => {
+    if (!vapi || !inCall) return;
+    muted = !muted;
+    vapi.setMuted(muted);
+    muteBtn.classList.toggle('muted', muted);
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+    setStatus(muted
+      ? '<b style="color:var(--red)">MIC MUTED</b> — tap 🔇 to unmute.'
+      : '<b style="color:var(--green)">LISTENING</b> — go ahead and talk. Tap ⏹ to end.');
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def _ensure_voice_component_files():
+    """Write voice_component/index.html beside app.py (only if changed)."""
+    VOICE_COMPONENT_DIR.mkdir(exist_ok=True)
+    index_path = VOICE_COMPONENT_DIR / "index.html"
+    try:
+        current = (
+            index_path.read_text(encoding="utf-8")
+            if index_path.exists()
+            else None
+        )
+        if current != VOICE_COMPONENT_HTML:
+            index_path.write_text(VOICE_COMPONENT_HTML, encoding="utf-8")
+    except Exception as e:
+        st.warning(f"Could not write voice component files: {e}")
+
+
+_ensure_voice_component_files()
+
+_vapi_voice_component = components.declare_component(
+    "satquery_vapi_voice",
+    path=str(VOICE_COMPONENT_DIR),
+)
+
 
 def render_vapi_voice_widget():
     """
-    Render a button that opens the SatQuery AI voice assistant in a new
-    browser tab, rather than embedding the <vapi-widget> inline inside
-    Streamlit's components.html iframe.
+    Inline tap-to-talk voice assistant (stays in the SAME tab).
 
-    Why: components.html renders content inside a sandboxed iframe.
-    Voice widgets need microphone access via getUserMedia(), and that
-    permission behaves unreliably (often silently denied) for content
-    running inside a nested/sandboxed iframe -- the widget loads and
-    looks fine, but the call never actually connects.
-
-    A real top-level browser tab has none of those sandbox
-    restrictions, so microphone access works normally there. We open
-    one using a Blob URL, generated entirely client-side (no extra
-    backend route needed). Streamlit's iframe sandbox policy already
-    includes "allow-popups" and "allow-popups-to-escape-sandbox", so
-    window.open() from inside components.html works and the new tab
-    is NOT sandboxed by the parent iframe's restrictions.
+    - Tap the mic  -> starts the call (browser asks for mic permission once)
+    - Tap again    -> ends the call
+    - Mute button  -> mutes/unmutes your mic during the call
+    - Live transcript of the conversation is shown under the button
     """
     if not VAPI_PUBLIC_KEY:
         st.warning(
@@ -1630,87 +2022,12 @@ def render_vapi_voice_widget():
         )
         return
 
-    # This is the full standalone page that will be opened in the new tab.
-    widget_page_html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>SatQuery AI Voice Assistant</title>
-  <style>
-    html, body {{
-      margin:0;
-      height:100%;
-      background:#0A0E14;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-family:'Space Grotesk', sans-serif;
-    }}
-  </style>
-</head>
-<body>
-  <vapi-widget
-    public-key="{VAPI_PUBLIC_KEY}"
-    assistant-id="{VAPI_ASSISTANT_ID}"
-    mode="voice"
-    size="full"
-    theme="dark">
-  </vapi-widget>
-  <script
-    src="https://unpkg.com/@vapi-ai/client-sdk-react/dist/embed/widget.umd.js"
-    async
-    type="text/javascript">
-  </script>
-</body>
-</html>"""
-
-    # Escape backticks/script-closing tags so this safely nests inside
-    # the JS template literal in launcher_html below.
-    escaped_html = (
-        widget_page_html
-        .replace("\\", "\\\\")
-        .replace("`", "\\`")
-        .replace("</script>", "<\\/script>")
+    _vapi_voice_component(
+        public_key=VAPI_PUBLIC_KEY,
+        assistant_id=VAPI_ASSISTANT_ID,
+        key="satquery_vapi_voice",
+        default=None,
     )
-
-    launcher_html = f"""
-    <div style="width:100%; display:flex; flex-direction:column; align-items:center; gap:0.5rem; padding:0.75rem 0;">
-      <button id="satquery-voice-btn" style="
-          background:#10151D; color:#E8A33D; border:1px solid #3A4552;
-          font-family:'IBM Plex Mono', monospace; font-size:0.85rem;
-          padding:0.75rem 1.6rem; cursor:pointer;">
-        🎙️ Start voice call with SatQuery AI
-      </button>
-      <div id="satquery-voice-note" style="
-          font-family:'IBM Plex Mono', monospace; font-size:0.72rem;
-          color:#7C8A9A;">
-        Opens in a new tab so your microphone permission works correctly.
-      </div>
-    </div>
-    <script>
-      (function () {{
-        var btn = document.getElementById('satquery-voice-btn');
-        var note = document.getElementById('satquery-voice-note');
-        btn.addEventListener('click', function () {{
-          try {{
-            var html = `{escaped_html}`;
-            var blob = new Blob([html], {{ type: 'text/html' }});
-            var url = URL.createObjectURL(blob);
-            var win = window.open(url, '_blank');
-            if (!win) {{
-              note.textContent = 'Your browser blocked the popup. Please allow popups for this site and click the button again.';
-              note.style.color = '#C9614F';
-            }}
-          }} catch (err) {{
-            note.textContent = 'Could not open the voice assistant: ' + err;
-            note.style.color = '#C9614F';
-          }}
-        }});
-      }})();
-    </script>
-    """
-
-    components.html(launcher_html, height=110, scrolling=False)
 
 
 # ============================================================
@@ -1851,7 +2168,7 @@ with left:
 with right:
     html_block(
         f"""
-        <div class="console-panel">
+        <div class="console-panel" style="margin-bottom:0.8rem;">
             <div class="panel-label">IMAGE STATUS</div>
             <div class="console-row"><span>File</span><b>{uploaded_file.name}</b></div>
             <div class="console-row"><span>Dimensions</span><b>{image.width} × {image.height}</b></div>
@@ -1867,6 +2184,9 @@ with right:
             + st.session_state.voice_image_sync_error
         )
 
+    # UI: live analysis summary lives here (filled at the end of the script)
+    summary_slot = st.empty()
+
 
 # ============================================================
 # STEP 03 — REAL-TIME VOICE ASSISTANT
@@ -1875,240 +2195,334 @@ with right:
 panel_head("STEP 03", "Talk to SatQuery AI")
 
 st.markdown(
-    "Ask naturally about the uploaded image. The voice assistant uses the "
-    "same synchronized image as the specialist analysis tools.",
+    "Ask naturally about the uploaded image. Tap the mic to start talking — "
+    "the voice assistant uses the same synchronized image as the specialist "
+    "analysis tools.",
 )
 render_vapi_voice_widget()
 
 
 # ============================================================
-# STEP 4 — OBJECT DETECTION
+# ANALYSIS RESULTS  (UI: one tabbed panel, redrawn at end of each run)
 # ============================================================
 
-# Object detection is intentionally hidden until the user asks an
-# object-related question.
-if st.session_state.detections is not None:
-    panel_head("STEP 04", "Satellite object detection")
+def _png_bytes(img_like):
+    """Encode a PIL image / RGB array / image path as PNG bytes (for download)."""
+    import io
 
-    detections = st.session_state.detections
-    detection_image = st.session_state.detection_image
-    detection_error = st.session_state.detection_error
+    try:
+        if isinstance(img_like, (str, Path)):
+            return Path(img_like).read_bytes()
+        if isinstance(img_like, np.ndarray):
+            img_like = Image.fromarray(img_like.astype("uint8"))
+        buf = io.BytesIO()
+        img_like.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
 
-    if detection_error:
-        st.warning(detection_error)
-    elif detection_image is not None:
-        det_left, det_right = st.columns([2.2, 1])
 
-        with det_left:
-            st.image(
-                detection_image,
-                caption="DOTA OBB detector output",
-                use_container_width=True,
-            )
-
-        with det_right:
-            counts = summarize_detections(detections)
-
-            html_block(
-                f"""
-                <div class="console-panel">
-                    <div class="panel-label">DETECTION STATUS</div>
-                    <div class="console-row"><span>Total objects</span><b>{len(detections)}</b></div>
-                    <div class="console-row"><span>Model</span><b>YOLO26n-OBB</b></div>
-                    <div class="console-row"><span>Threshold</span><b>{DETECTOR_CONFIDENCE:.2f}</b></div>
-                </div>
-                """
-            )
-
-            if counts:
-                st.markdown("**Detected classes**")
-                for name, count in sorted(counts.items()):
-                    st.write(f"• **{name}** — {count}")
-            else:
-                st.caption("No objects detected above the confidence threshold.")
-
-# ============================================================
-# STEP 03B — BUILDING DETECTION
-# ============================================================
-
-# Building detection is intentionally hidden until the user asks a
-# building-related question.
-if st.session_state.building_detection_image is not None:
-    panel_head("STEP 03B", "Building detection")
-
-    building_detections = st.session_state.building_detections or []
-    building_detection_image = st.session_state.building_detection_image
-    building_coverage = st.session_state.building_coverage
-
-    bld_left, bld_right = st.columns([2.2, 1])
-
-    with bld_left:
-        st.image(
-            building_detection_image,
-            caption="HOTOSM building detection output",
+def _download_button(img_like, filename, key):
+    data = _png_bytes(img_like)
+    if data:
+        st.download_button(
+            "⬇ Download annotated image",
+            data,
+            file_name=filename,
+            mime="image/png",
+            key=key,
             use_container_width=True,
         )
 
-    with bld_right:
-        html_block(
-            f"""
-            <div class="console-panel">
-                <div class="panel-label">BUILDING DETECTION STATUS</div>
-                <div class="console-row"><span>Building regions</span><b>{len(building_detections)}</b></div>
-                <div class="console-row"><span>Coverage</span><b>{building_coverage:.1f}%</b></div>
-                <div class="console-row"><span>Model</span><b>HOTOSM DINOv3-S</b></div>
-                <div class="console-row"><span>Threshold</span><b>{BUILDING_THRESHOLD:.4f}</b></div>
-            </div>
-            """
-        )
 
-        st.caption(
-            "Building regions are derived from the local building-segmentation model; "
-            "they are not Gemini guesses."
-        )
+def _rows_panel(label, rows):
+    body = "".join(
+        f'<div class="console-row"><span>{k}</span><b>{v}</b></div>'
+        for k, v in rows
+    )
+    html_block(
+        f'<div class="console-panel" style="margin-bottom:0.8rem;">'
+        f'<div class="panel-label">{label}</div>{body}</div>'
+    )
 
-# ============================================================
-# STEP 03C — LOCAL VEGETATION DETECTION
-# ============================================================
 
-# Vegetation detection is intentionally hidden until the user asks
-# a vegetation-related question. Uploading an image alone never runs it.
-if st.session_state.vegetation_result is not None:
-    panel_head("STEP 03C", "Local vegetation detection")
+def render_summary_panel():
+    """Live summary shown beside the uploaded image."""
+    det = st.session_state.detections
+    bld = st.session_state.building_detections
+    veg = st.session_state.vegetation_result
+    ndvi_on = bool(st.session_state.ndvi_requested and ndvi_stats)
 
-    veg_result = st.session_state.vegetation_result
-    veg_error = st.session_state.vegetation_error
+    def cell(text, done):
+        color = "var(--green)" if done else "var(--text-dim)"
+        return f'<span style="color:{color}">{text}</span>'
 
-    if veg_error:
-        st.warning(veg_error)
-    else:
-        veg_left, veg_right = st.columns([2.2, 1])
+    rows = [
+        (
+            "Objects",
+            cell(
+                f"{len(det)} found" if det is not None else "not run",
+                det is not None,
+            ),
+        ),
+        (
+            "Buildings",
+            cell(
+                f"{len(bld)} regions · {st.session_state.building_coverage:.1f}%"
+                if bld is not None
+                else "not run",
+                bld is not None,
+            ),
+        ),
+        (
+            "Vegetation (RGB)",
+            cell(
+                f"{veg.get('coverage', 0.0):.1f}%" if veg else "not run",
+                bool(veg),
+            ),
+        ),
+        (
+            "NDVI mean",
+            cell(
+                f"{ndvi_stats['mean_ndvi']:.3f}" if ndvi_on else "not run",
+                ndvi_on,
+            ),
+        ),
+    ]
 
-        with veg_left:
-            result_path = veg_result.get("result_path")
-            if result_path and Path(result_path).exists():
-                st.image(
-                    result_path,
-                    caption="Local RGB vegetation detection output",
-                    use_container_width=True,
-                )
+    if det:
+        counts = summarize_detections(det)
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
+        rows.append(("Top classes", ", ".join(f"{n} ×{c}" for n, c in top)))
 
-        with veg_right:
-            html_block(
-                f"""
-                <div class="console-panel">
-                    <div class="panel-label">VEGETATION DETECTION STATUS</div>
-                    <div class="console-row"><span>Coverage</span><b>{veg_result.get('coverage', 0.0):.1f}%</b></div>
-                    <div class="console-row"><span>Regions</span><b>{veg_result.get('regions', 0)}</b></div>
-                    <div class="console-row"><span>Method</span><b>LOCAL RGB + HSV + ExG + WATER REJECTION</b></div>
-                    <div class="console-row"><span>Gemini</span><b>NOT USED</b></div>
-                </div>
-                """
-            )
+    _rows_panel("ANALYSIS SUMMARY", rows)
 
-            st.caption(
-                "Visible vegetation is estimated locally from the uploaded RGB image. "
-                "This is not NDVI and Gemini is not used."
-            )
+    if det is None and bld is None and not veg and not ndvi_on:
+        st.caption("Nothing analysed yet — ask a question below or use the mic.")
 
-# ============================================================
-# STEP 4 — GIS
-# ============================================================
 
-# GIS/NDVI results are shown only after the user asks a GIS/NDVI question.
-if st.session_state.ndvi_requested:
-    panel_head("STEP 05", "GIS / NDVI analysis")
+def render_results_panel():
+    """One tabbed panel with every analysis result produced so far."""
+    det = st.session_state.detections
+    det_img = st.session_state.detection_image
+    det_err = st.session_state.detection_error
+    bld = st.session_state.building_detections
+    bld_img = st.session_state.building_detection_image
+    bld_err = st.session_state.building_error
+    veg = st.session_state.vegetation_result
+    veg_err = st.session_state.vegetation_error
 
-    if ndvi_stats:
-        html_block(
-            f"""
-            <div class="stat-grid">
-                <div class="stat-cell">
-                    <div class="stat-label">MEAN NDVI</div>
-                    <div class="stat-value">{ndvi_stats['mean_ndvi']:.3f}</div>
-                </div>
-                <div class="stat-cell">
-                    <div class="stat-label">NDVI ≥ 0.30</div>
-                    <div class="stat-value">{ndvi_stats['vegetation_percentage']:.1f}%</div>
-                </div>
-                <div class="stat-cell">
-                    <div class="stat-label">NDVI ≥ 0.40</div>
-                    <div class="stat-value">{ndvi_stats['moderate_percentage']:.1f}%</div>
-                </div>
-                <div class="stat-cell">
-                    <div class="stat-label">NDVI ≥ 0.50</div>
-                    <div class="stat-value">{ndvi_stats['dense_percentage']:.1f}%</div>
-                </div>
-            </div>
-            """
-        )
+    spec = []
+    if det is not None or det_err:
+        spec.append(("🛩️ Objects", "obj"))
+    if bld_img is not None or bld_err:
+        spec.append(("🏠 Buildings", "bld"))
+    if veg is not None or veg_err:
+        spec.append(("🌱 Vegetation", "veg"))
+    if st.session_state.ndvi_requested:
+        spec.append(("🗺️ NDVI", "ndvi"))
 
-        st.caption(
-            "These measurements come from the connected QGIS ndvi.tif raster, not from RGB colour estimation."
-        )
+    if not spec:
+        return
 
-        regions = ndvi_stats.get("regions") or {}
-        highest_region = ndvi_stats.get("highest_vegetation_region")
+    # Put the tab for the most recently used tool first.
+    focus = st.session_state.get("results_focus")
+    spec.sort(key=lambda item: 0 if item[1] == focus else 1)
 
-        compass_cells = []
-        for name in ("North", "South", "East", "West"):
-            region = regions.get(name)
-            is_highest = name == highest_region
-            cell_class = "compass-cell highest" if is_highest else "compass-cell"
+    panel_head("RESULTS", "Analysis results")
+    tabs = st.tabs([label for label, _ in spec])
 
-            if region:
-                value_html = f"{region['vegetation_percentage']:.1f}%"
-                sub_html = f"mean {region['mean_ndvi']:.3f}"
-            else:
-                value_html = "—"
-                sub_html = "no data"
+    for tab, (_, key) in zip(tabs, spec):
+        with tab:
 
-            compass_cells.append(
-                f"""
-                <div class="{cell_class}">
-                    <div class="compass-label">{name.upper()}</div>
-                    <div class="compass-value">{value_html}</div>
-                    <div class="compass-sub">{sub_html}</div>
-                </div>
-                """
-            )
+            # ---------------- OBJECTS ----------------
+            if key == "obj":
+                if det_err:
+                    st.warning(det_err)
+                elif det_img is not None:
+                    left_col, right_col = st.columns([2.2, 1])
+                    with left_col:
+                        st.image(
+                            det_img,
+                            caption="DOTA OBB detector output",
+                            use_container_width=True,
+                        )
+                    with right_col:
+                        counts = summarize_detections(det or [])
+                        _rows_panel(
+                            "DETECTION STATUS",
+                            [
+                                ("Total objects", len(det or [])),
+                                ("Model", "YOLO26n-OBB"),
+                                ("Threshold", f"{DETECTOR_CONFIDENCE:.2f}"),
+                            ],
+                        )
+                        if counts:
+                            _rows_panel(
+                                "DETECTED CLASSES",
+                                [(n, c) for n, c in sorted(counts.items())],
+                            )
+                        else:
+                            st.caption(
+                                "No objects detected above the confidence threshold."
+                            )
+                        _download_button(det_img, "satquery_objects.png", "dl_objects")
 
-        html_block(
-            f"""
-            <div class="panel-label" style="margin:1.1rem 0 0.4rem 0;">DIRECTIONAL VEGETATION DISTRIBUTION</div>
-            <div class="compass-grid">
-                {''.join(compass_cells)}
-            </div>
-            """
-        )
+            # ---------------- BUILDINGS ----------------
+            elif key == "bld":
+                if bld_err:
+                    st.warning(bld_err)
+                elif bld_img is not None:
+                    left_col, right_col = st.columns([2.2, 1])
+                    with left_col:
+                        st.image(
+                            bld_img,
+                            caption="HOTOSM building detection output",
+                            use_container_width=True,
+                        )
+                    with right_col:
+                        _rows_panel(
+                            "BUILDING DETECTION STATUS",
+                            [
+                                ("Building regions", len(bld or [])),
+                                ("Coverage", f"{st.session_state.building_coverage:.1f}%"),
+                                ("Model", "HOTOSM DINOv3-S"),
+                                ("Threshold", f"{BUILDING_THRESHOLD:.4f}"),
+                            ],
+                        )
+                        st.caption(
+                            "Building regions come from the local segmentation "
+                            "model, not from Gemini guesses."
+                        )
+                        _download_button(bld_img, "satquery_buildings.png", "dl_buildings")
 
-        if highest_region:
-            st.caption(
-                f"Vegetation coverage is highest in the {highest_region} half of the raster."
-            )
-        else:
-            st.caption("Not enough valid pixels to compute a directional breakdown.")
-    else:
-        st.info("No ndvi.tif was found beside app.py. Visual AI analysis will still work.")
+            # ---------------- VEGETATION ----------------
+            elif key == "veg":
+                if veg_err:
+                    st.warning(veg_err)
+                elif veg:
+                    left_col, right_col = st.columns([2.2, 1])
+                    result_path = veg.get("result_path")
+                    with left_col:
+                        if result_path and Path(result_path).exists():
+                            st.image(
+                                result_path,
+                                caption="Local RGB vegetation detection output",
+                                use_container_width=True,
+                            )
+                    with right_col:
+                        _rows_panel(
+                            "VEGETATION DETECTION STATUS",
+                            [
+                                ("Coverage", f"{veg.get('coverage', 0.0):.1f}%"),
+                                ("Regions", veg.get("regions", 0)),
+                                ("Method", "LOCAL RGB"),
+                                ("Gemini", "NOT USED"),
+                            ],
+                        )
+                        st.caption(
+                            "Estimated locally from the RGB image. This is not NDVI."
+                        )
+                        if result_path and Path(result_path).exists():
+                            _download_button(result_path, "satquery_vegetation.png", "dl_vegetation")
+
+            # ---------------- NDVI ----------------
+            elif key == "ndvi":
+                if ndvi_stats:
+                    html_block(
+                        f"""
+                        <div class="stat-grid">
+                            <div class="stat-cell">
+                                <div class="stat-label">MEAN NDVI</div>
+                                <div class="stat-value">{ndvi_stats['mean_ndvi']:.3f}</div>
+                            </div>
+                            <div class="stat-cell">
+                                <div class="stat-label">NDVI ≥ 0.30</div>
+                                <div class="stat-value">{ndvi_stats['vegetation_percentage']:.1f}%</div>
+                            </div>
+                            <div class="stat-cell">
+                                <div class="stat-label">NDVI ≥ 0.40</div>
+                                <div class="stat-value">{ndvi_stats['moderate_percentage']:.1f}%</div>
+                            </div>
+                            <div class="stat-cell">
+                                <div class="stat-label">NDVI ≥ 0.50</div>
+                                <div class="stat-value">{ndvi_stats['dense_percentage']:.1f}%</div>
+                            </div>
+                        </div>
+                        """
+                    )
+                    st.caption(
+                        "These measurements come from the connected QGIS ndvi.tif "
+                        "raster, not from RGB colour estimation."
+                    )
+
+                    regions = ndvi_stats.get("regions") or {}
+                    highest_region = ndvi_stats.get("highest_vegetation_region")
+
+                    compass_cells = []
+                    for name in ("North", "South", "East", "West"):
+                        region = regions.get(name)
+                        cell_class = (
+                            "compass-cell highest"
+                            if name == highest_region
+                            else "compass-cell"
+                        )
+                        if region:
+                            value_html = f"{region['vegetation_percentage']:.1f}%"
+                            sub_html = f"mean {region['mean_ndvi']:.3f}"
+                        else:
+                            value_html = "—"
+                            sub_html = "no data"
+
+                        compass_cells.append(
+                            f"""
+                            <div class="{cell_class}">
+                                <div class="compass-label">{name.upper()}</div>
+                                <div class="compass-value">{value_html}</div>
+                                <div class="compass-sub">{sub_html}</div>
+                            </div>
+                            """
+                        )
+
+                    html_block(
+                        f"""
+                        <div class="panel-label" style="margin:1.1rem 0 0.4rem 0;">DIRECTIONAL VEGETATION DISTRIBUTION</div>
+                        <div class="compass-grid">
+                            {''.join(compass_cells)}
+                        </div>
+                        """
+                    )
+
+                    if highest_region:
+                        st.caption(
+                            f"Vegetation coverage is highest in the {highest_region} half of the raster."
+                        )
+                else:
+                    st.info(
+                        "No ndvi.tif was found beside app.py. "
+                        "Visual AI analysis will still work."
+                    )
+
+
+# The panel is drawn into this slot at the END of the script so it always
+# shows the latest detector output from the current run.
+results_slot = st.empty()
+
 
 # ============================================================
 # STEP 5 — CHAT
 # ============================================================
 
-panel_head("STEP 06", "Ask SatQuery AI")
+panel_head("STEP 04", "Ask SatQuery AI")
 
 st.caption("Ask multiple questions about the same uploaded image. SatQuery automatically routes each question to the relevant analysis tools.")
 
 example_questions = [
-    "How many planes or vehicles were detected?",
     "What objects were detected?",
-    "Is there vegetation?",
-    "Is there vegetation in this image?",
-    "What is the NDVI of this area?",
-    "How much vegetation is there?",
-    "How many planes are there and what is the vegetation condition?",
     "How many buildings are there?",
-    "Show me the detected buildings.",
+    "Is there vegetation?",
+    "What is the NDVI of this area?",
+    "Describe this scene.",
 ]
 
 cols = st.columns(len(example_questions))
@@ -2309,40 +2723,38 @@ if question:
                 placeholder.markdown(full_response)
                 answer = full_response
 
-        # Show detector evidence only when the user's question triggered it.
-        if "HOTOSM BUILDING DETECTOR" in route_info.get("tools", []):
-            if st.session_state.building_detection_image is not None:
-                st.image(
-                    st.session_state.building_detection_image,
-                    caption="HOTOSM building detection output",
-                    use_container_width=True,
-                )
-                st.caption(
-                    f"Building regions detected: {len(st.session_state.building_detections or [])} "
-                    f"· Coverage: {st.session_state.building_coverage:.1f}%"
-                )
-
-        # Show vegetation evidence only when the user's question triggered it.
-        if "LOCAL VEGETATION DETECTOR" in route_info.get("tools", []):
-            veg_result = st.session_state.vegetation_result
-            veg_error = st.session_state.vegetation_error
-            if veg_error:
-                st.warning(veg_error)
-            elif veg_result is not None:
-                result_path = veg_result.get("result_path")
-                if result_path and Path(result_path).exists():
-                    st.image(
-                        result_path,
-                        caption="Local RGB vegetation detection output",
-                        use_container_width=True,
-                    )
-                st.caption(
-                    f"RGB vegetation coverage: {veg_result.get('coverage', 0.0):.1f}% "
-                    f"· Regions: {veg_result.get('regions', 0)} · Gemini: NOT USED"
-                )
+        # Annotated evidence now lives in the tabbed "Analysis results" panel
+        # (drawn at the end of the script), so it is not repeated here.
+        _tab_for_tool = {
+            "DOTA OBJECT DETECTOR": "obj",
+            "HOTOSM BUILDING DETECTOR": "bld",
+            "LOCAL VEGETATION DETECTOR": "veg",
+            "QGIS / NDVI": "ndvi",
+        }
+        _used_tabs = [
+            _tab_for_tool[t]
+            for t in route_info.get("tools", [])
+            if t in _tab_for_tool
+        ]
+        if _used_tabs:
+            st.session_state.results_focus = _used_tabs[0]
+            st.caption(
+                "📊 Annotated results are in the **Analysis results** panel above."
+            )
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
         render_feedback_row(len(st.session_state.messages) - 1)
+
+
+# ============================================================
+# DRAW LIVE RESULT PANELS  (UI)
+# ============================================================
+
+with results_slot.container():
+    render_results_panel()
+
+with summary_slot.container():
+    render_summary_panel()
 
 
 # ============================================================
